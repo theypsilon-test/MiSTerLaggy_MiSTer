@@ -128,12 +128,13 @@ module sys_top
 wire SD_CS, SD_CLK, SD_MOSI, SD_MISO, SD_CD;
 
 `ifndef MISTER_DUAL_SDRAM
-	assign SD_CD       = mcp_en ? mcp_sdcd : SDCD_SPDIF;
+	wire   sd_cd       = SDCD_SPDIF & ~SW[2]; // SW[2]=ON workaround for faulty boards without SD card detect pin.
+	assign SD_CD       = mcp_en ? mcp_sdcd : sd_cd;
 	assign SD_MISO     = SD_CD | (mcp_en ? SD_SPI_MISO : (VGA_EN | SDIO_DAT[0]));
 	assign SD_SPI_CS   = mcp_en ?  (mcp_sdcd  ? 1'bZ : SD_CS) : (sog & ~cs1 & ~VGA_EN) ? 1'b1 : 1'bZ;
 	assign SD_SPI_CLK  = (~mcp_en | mcp_sdcd) ? 1'bZ : SD_CLK;
 	assign SD_SPI_MOSI = (~mcp_en | mcp_sdcd) ? 1'bZ : SD_MOSI;
-	assign {SDIO_CLK,SDIO_CMD,SDIO_DAT} = av_dis ? 6'bZZZZZZ : (mcp_en | (SDCD_SPDIF & ~SW[2])) ? {vga_g,vga_r,vga_b} : {SD_CLK,SD_MOSI,SD_CS,3'bZZZ};
+	assign {SDIO_CLK,SDIO_CMD,SDIO_DAT} = av_dis ? 6'bZZZZZZ : (mcp_en | sd_cd) ? {vga_g,vga_r,vga_b} : {SD_CLK,SD_MOSI,SD_CS,3'bZZZ};
 `else
 	assign SD_CD       = mcp_sdcd;
 	assign SD_MISO     = mcp_sdcd | SD_SPI_MISO;
@@ -226,16 +227,6 @@ always @(posedge FPGA_CLK2_50) begin
 	end
 end
 
-
-///////////////////////// VIDEO TEST I/O ////////////////////////////////
-wire vio_en;
-wire vio_strobe;
-reg [15:0] vio_dout;
-wire [15:0] vio_din;
-reg vio_override = 0;
-
-
-
 /////////////////////////  HPS I/O  /////////////////////////////////////
 
 // gp_in[31] = 0 - quick flag that FPGA is initialized (HPS reads 1 when FPGA is not in user mode)
@@ -309,8 +300,9 @@ wire       audio_96k    = cfg[6];
 wire       csync_en     = cfg[3];
 wire       io_osd_vga   = io_ss1 & ~io_ss2;
 `ifndef MISTER_DUAL_SDRAM
-	wire    ypbpr_en     = cfg[5];
-	wire    sog          = cfg[9];
+	wire forced_scandoubler = cfg[4];
+	wire ypbpr_en           = cfg[5];
+	wire sog                = cfg[9];
 	`ifdef MISTER_DEBUG_NOHDMI
 		wire vga_scaler   = 0;
 	`else
@@ -362,12 +354,6 @@ always@(posedge clk_sys) begin
 	reg  [7:0] cmd;
 	reg        has_cmd;
 	reg  [7:0] cnt = 0;
-
-	reg  [7:0] vio_cmd;
-	reg        vio_has_cmd;
-	reg  [7:0] vio_cnt = 0;
-	reg  [1:0] vio_cfg = 0;
-
 	reg        vs_d0,vs_d1,vs_d2;
 	reg  [4:0] acx_att;
 	reg  [7:0] fb_crc;
@@ -377,16 +363,17 @@ always@(posedge clk_sys) begin
 `ifndef MISTER_DEBUG_NOHDMI
 	shadowmask_wr <= 0;
 `endif
-	if(reset) begin
-		vio_override <= 0;
-	end else if(~io_uio) begin
+
+	if(~io_uio) begin
 		has_cmd <= 0;
 		cmd <= 0;
 		areset <= 0;
 		acx_att <= 0;
 		acx <= acx >> acx_att;
 		io_dout_sys <= 0;
-	end else if(io_strobe) begin
+	end
+	else
+	if(io_strobe) begin
 		io_dout_sys <= 0;
 		if(!has_cmd) begin
 			has_cmd <= 1;
@@ -416,7 +403,7 @@ always@(posedge clk_sys) begin
 				cfg_set <= 1;
 				scaler_out <= 1;
 			end
-			if((cmd == 'h20) && ~vio_override) begin
+			if(cmd == 'h20) begin
 				cfg_set <= 0;
 				if(cnt<8) begin
 					case(cnt[2:0])
@@ -514,56 +501,21 @@ always@(posedge clk_sys) begin
 				endcase
 			end
 `endif
-`ifndef MISTER_DISABLE_YC
 			if(cmd == 'h41) begin
 				case(cnt[3:0])
-					 0: {pal_en,cvbs,yc_en}    <= io_din[2:0];
-					 1: PhaseInc[15:0]         <= io_din;
-					 2: PhaseInc[31:16]        <= io_din;
-					 3: PhaseInc[39:32]        <= io_din[7:0];
-					 4: ColorBurst_Range[15:0] <= io_din;
-					 5: ColorBurst_Range[16]   <= io_din[0];
-				endcase
-			end
+`ifndef MISTER_DISABLE_YC
+					0: {pal_en,cvbs,yc_en}    <= io_din[2:0];
+					4: ColorBurst_Range[15:0] <= io_din;
+					5: ColorBurst_Range[16]   <= io_din[0];
 `endif
-		end
-	end
-
-	if(~vio_en) begin
-		vio_has_cmd <= 0;
-		vio_cmd <= 0;
-		vio_dout <= 0;
-	end else if(vio_strobe) begin
-		vio_dout <= 0;
-		if(!vio_has_cmd) begin
-			vio_has_cmd <= 1;
-			vio_cmd <= vio_din[7:0];
-			vio_cnt <= 0;
-		end else begin
-			vio_cnt <= vio_cnt + 1'd1;
-			if(vio_cmd == 'h01) begin
-				case(vio_cnt)
-					0: WIDTH  <= vio_din[11:0];
-					1: HFP    <= vio_din[11:0];
-					2: HS     <= {vio_din[15], vio_din[11:0]};
-					3: HBP    <= vio_din[11:0];
-					4: HEIGHT <= vio_din[11:0];
-					5: VFP    <= vio_din[11:0];
-					6: VS     <= {vio_din[15], vio_din[11:0]};
-					7: VBP    <= vio_din[11:0];
-					8: lowlat <= vio_din[0];
+					// Subcarrier commands (independent of YC module)
+					1: PhaseInc[15:0]         <= io_din;
+					2: PhaseInc[31:16]        <= io_din;
+					3: PhaseInc[39:32]        <= io_din[7:0];
+`ifndef MISTER_DUAL_SDRAM
+					6: subcarrier             <= io_din[0];
+`endif
 				endcase
-			end else if (vio_cmd == 'h02) begin
-				if (vio_cnt==0) cfg_custom_p1 <= vio_din[5:0];
-				if (vio_cnt==1) cfg_custom_p2[15:0]  <= vio_din;
-				if (vio_cnt==2) begin
-					cfg_custom_p2[31:16] <= vio_din;
-					cfg_custom_t <= ~cfg_custom_t;
-				end
-			end else if(vio_cmd == 'h03) begin
-				vio_override <= vio_din[0];
-			end else if(vio_cmd == 'h04) begin
-				cfg_set <= vio_din[0];
 			end
 		end
 	end
@@ -732,6 +684,7 @@ wire         vbuf_write;
 wire  [23:0] hdmi_data;
 wire         hdmi_vs, hdmi_hs, hdmi_de, hdmi_vbl, hdmi_brd;
 wire         freeze;
+wire         bob_deint;
 
 `ifndef MISTER_DEBUG_NOHDMI
 	wire clk_hdmi  = hdmi_clk_out;
@@ -763,9 +716,10 @@ wire         freeze;
 	)
 	ascal
 	(
-		.reset_na (~reset_req),
-		.run      (1),
-		.freeze   (freeze),
+		.reset_na   (~reset_req),
+		.run        (1),
+		.freeze     (freeze),
+		.bob_deint  (bob_deint),
 
 		.i_clk    (clk_ihdmi),
 		.i_ce     (ce_hpix),
@@ -927,8 +881,8 @@ always @(posedge clk_vid) begin
 	reg [11:0] hcalc,videoh;
 	reg  [2:0] state;
 
-	hdmi_height <= HEIGHT;
-	hdmi_width  <= WIDTH << HDMI_PR;
+	hdmi_height <= (VSET && (VSET < HEIGHT)) ? VSET : HEIGHT;
+	hdmi_width  <= (HSET && (HSET < WIDTH))  ? HSET << HDMI_PR : WIDTH << HDMI_PR;
 
 	if(!ARY) begin
 		if(ARX == 1) begin
@@ -1450,7 +1404,6 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 	reg         yc_en;
 	reg         cvbs;
 	reg  [16:0] ColorBurst_Range;
-	reg  [39:0] PhaseInc;
 	wire [23:0] yc_o;
 	wire        yc_hs, yc_vs, yc_cs, yc_de;
 
@@ -1474,7 +1427,20 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 	);
 `endif
 
+reg  [39:0] PhaseInc;
+
 `ifndef MISTER_DUAL_SDRAM
+	// Subcarrier generation for external encoders (independent of YC module)
+	reg         subcarrier;
+
+	reg  [39:0] sub_accum;
+	always @(posedge clk_vid) sub_accum <= sub_accum + PhaseInc;
+
+	// 1-bit output for positive/negative of wave, no LUT required. Output 1 if disabled for further logic
+	reg subcarrier_out;
+	always @(posedge clk_vid) subcarrier_out <= ~(subcarrier & csync_en & ~ypbpr_en & ~forced_scandoubler & ~vgas_en) | sub_accum[39];
+
+
 	wire VGA_DISABLE;
 	wire [23:0] vgas_o;
 	wire vgas_hs, vgas_vs, vgas_cs, vgas_de;
@@ -1527,7 +1493,7 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 	wire cs1 = vgas_en ? vgas_cs : vga_cs;
 	wire de1 = vgas_en ? vgas_de : vga_de;
 
-	assign VGA_VS = av_dis ? 1'bZ      : ((vgas_en ? (~vgas_vs ^ VS[12])                         : VGA_DISABLE ? 1'd1 : ~vga_vs) | csync_en);
+	assign VGA_VS = av_dis ? 1'bZ      :(((vgas_en ? (~vgas_vs ^ VS[12])                         : VGA_DISABLE ? 1'd1 : ~vga_vs) | csync_en) & subcarrier_out);
 	assign VGA_HS = av_dis ? 1'bZ      :  (vgas_en ? ((csync_en ? ~vgas_cs : ~vgas_hs) ^ HS[12]) : VGA_DISABLE ? 1'd1 : (csync_en ? ~vga_cs : ~vga_hs));
 	assign VGA_R  = av_dis ? 6'bZZZZZZ :   vgas_en ? vgas_o[23:18]                               : VGA_DISABLE ? 6'd0 : vga_o[23:18];
 	assign VGA_G  = av_dis ? 6'bZZZZZZ :   vgas_en ? vgas_o[15:10]                               : VGA_DISABLE ? 6'd0 : vga_o[15:10];
@@ -1791,6 +1757,7 @@ emu emu
 	.HDMI_HEIGHT(direct_video ? 12'd0 : hdmi_height),
 	.HDMI_FREEZE(freeze),
 	.HDMI_BLACKOUT(hdmi_blackout),
+	.HDMI_BOB_DEINT(bob_deint),
 
 	.CLK_VIDEO(clk_vid),
 	.CE_PIXEL(ce_pix),
@@ -1883,15 +1850,7 @@ emu emu
 	.UART_DSR(uart_dtr),
 
 	.USER_OUT(user_out),
-	.USER_IN(user_in),
-
-	.VIO_EN(vio_en),
-	.VIO_STROBE(vio_strobe),
-	.VIO_DOUT(vio_dout),
-	.VIO_DIN(vio_din),
-	.VIO_CFG({14'd0, vga_scaler, direct_video}),
-
-	.HDMI_VBL(hdmi_vbl)
+	.USER_IN(user_in)
 );
 
 endmodule
